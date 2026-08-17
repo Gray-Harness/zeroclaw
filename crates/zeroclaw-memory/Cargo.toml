@@ -25,9 +25,15 @@ sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "sync", "time"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+lancedb = { version = "0.37.1", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+arrow-cast = { version = "58", optional = true }
+futures = { version = "0.3", optional = true }
 
 [features]
 memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
+memory-lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-cast", "dep:futures"]
 
 [dev-dependencies]
 tempfile = "3.26"

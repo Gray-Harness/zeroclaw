@@ -9605,6 +9605,12 @@ pub struct MemoryConfig {
     pub auto_hydrate: bool,
 
     // ── Retrieval Pipeline ─────────────────────────────────────
+    /// Derived vector index backend. `none` keeps brute-force SQLite scans;
+    /// `lancedb` builds a disposable LanceDB index next to the SQLite file for
+    /// approximate vector / full-text / hybrid search. SQLite remains the source
+    /// of truth; the index can always be rebuilt.
+    #[serde(default = "default_vector_index_backend")]
+    pub vector_index_backend: String,
     /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
@@ -9666,6 +9672,9 @@ pub struct MemoryPolicyConfig {
     pub read_only_namespaces: Vec<String>,
 }
 
+fn default_vector_index_backend() -> String {
+    "none".into()
+}
 fn default_retrieval_stages() -> Vec<String> {
     vec!["cache".into(), "fts".into(), "vector".into()]
 }
@@ -9769,6 +9778,7 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+            vector_index_backend: default_vector_index_backend(),
             retrieval_stages: default_retrieval_stages(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),

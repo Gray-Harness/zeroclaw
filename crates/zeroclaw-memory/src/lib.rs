@@ -36,6 +36,8 @@ pub mod importance;
 pub mod knowledge_graph;
 #[cfg(feature = "memory-postgres")]
 pub mod knowledge_graph_pg;
+#[cfg(feature = "memory-lancedb")]
+pub mod lancedb_index;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
@@ -391,15 +393,17 @@ pub fn create_memory_with_storage_and_routes(
             ));
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
+        let db_path = workspace_dir.join("memory").join("brain.db");
+        let mem = SqliteMemory::with_embedder_at_path_full(
             "sqlite",
-            workspace_dir,
+            &db_path,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
+            config.vector_index_backend.clone(),
         )?;
         Ok(mem)
     }

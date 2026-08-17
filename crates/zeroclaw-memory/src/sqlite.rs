@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -39,11 +39,17 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
 pub struct SqliteMemory {
     alias: String,
     conn: Arc<Mutex<Connection>>,
+    #[allow(dead_code)]
+    db_path: PathBuf,
     embedder: Arc<dyn EmbeddingProvider>,
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    #[allow(dead_code)]
+    vector_index_backend: String,
+    #[cfg(feature = "memory-lancedb")]
+    lance_index: parking_lot::Mutex<Option<Arc<super::lancedb_index::LanceDbVectorIndex>>>,
 }
 
 impl SqliteMemory {
@@ -85,22 +91,26 @@ impl SqliteMemory {
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
+            db_path,
             embedder: Arc::new(super::embeddings::NoopEmbedding),
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            vector_index_backend: "none".into(),
+            #[cfg(feature = "memory-lancedb")]
+            lance_index: parking_lot::Mutex::new(None),
         })
     }
 
-    /// Build SQLite memory with optional open timeout.
+    /// Build SQLite memory at an explicit database file path with optional open timeout.
     ///
-    /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
-    /// (capped at 300). Useful when the DB file may be locked or on slow storage.
-    /// `None` = wait indefinitely (default).
-    pub fn with_embedder(
+    /// The parent directory is created automatically. All other behavior matches
+    /// [`Self::with_embedder`]. This constructor disables the derived LanceDB index;
+    /// use [`Self::with_embedder_at_path_full`] to opt into it.
+    pub fn with_embedder_at_path(
         alias: &str,
-        workspace_dir: &Path,
+        db_path: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
         keyword_weight: f32,
@@ -108,14 +118,43 @@ impl SqliteMemory {
         open_timeout_secs: Option<u64>,
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("brain.db");
+        Self::with_embedder_at_path_full(
+            alias,
+            db_path,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            search_mode,
+            "none".into(),
+        )
+    }
+
+    /// Build SQLite memory at an explicit database file path with optional open timeout
+    /// and an optional derived LanceDB vector index backend.
+    ///
+    /// The parent directory is created automatically. SQLite remains the source of truth;
+    /// the LanceDB index is a disposable acceleration layer that is lazily opened on the
+    /// first recall when `vector_index_backend == "lancedb"`.
+    pub fn with_embedder_at_path_full(
+        alias: &str,
+        db_path: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
+        vector_index_backend: String,
+    ) -> anyhow::Result<Self> {
         let _startup_guard = acquire_sqlite_startup_lock();
 
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Self::open_connection(&db_path, open_timeout_secs)?;
+        let conn = Self::open_connection(db_path, open_timeout_secs)?;
 
         // ── Production-grade PRAGMA tuning ──────────────────────
         // foreign_keys ON: SQLite defaults FKs OFF per-connection;
@@ -136,17 +175,49 @@ impl SqliteMemory {
         )?;
 
         Self::init_schema(&conn)?;
-        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
+        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(db_path, &conn)?;
 
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
+            db_path: db_path.to_path_buf(),
             embedder,
             vector_weight,
             keyword_weight,
             cache_max,
             search_mode,
+            vector_index_backend,
+            #[cfg(feature = "memory-lancedb")]
+            lance_index: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Build SQLite memory with optional open timeout.
+    ///
+    /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
+    /// (capped at 300). Useful when the DB file may be locked or on slow storage.
+    /// `None` = wait indefinitely (default).
+    pub fn with_embedder(
+        alias: &str,
+        workspace_dir: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
+    ) -> anyhow::Result<Self> {
+        let db_path = workspace_dir.join("memory").join("brain.db");
+        Self::with_embedder_at_path(
+            alias,
+            &db_path,
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+            search_mode,
+        )
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -378,7 +449,7 @@ impl SqliteMemory {
         Ok(())
     }
 
-    fn category_to_str(cat: &MemoryCategory) -> String {
+    pub fn category_to_str(cat: &MemoryCategory) -> String {
         match cat {
             MemoryCategory::Core => "core".into(),
             MemoryCategory::Daily => "daily".into(),
@@ -399,7 +470,7 @@ impl SqliteMemory {
     /// Deterministic content hash for embedding cache.
     /// Uses SHA-256 (truncated) instead of DefaultHasher, which is
     /// explicitly documented as unstable across Rust versions.
-    fn content_hash(text: &str) -> String {
+    pub fn content_hash(text: &str) -> String {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest(text.as_bytes());
         // First 8 bytes → 16 hex chars, matching previous format length
@@ -622,6 +693,178 @@ impl SqliteMemory {
         Ok(scored)
     }
 
+    /// Fetch full `MemoryEntry` rows for a pre-merged list of scored ids.
+    ///
+    /// Applies session, since/until filters and preserves the input ordering
+    /// (which is assumed to be ranked by score).
+    fn fetch_entries_for_merged(
+        conn: &Connection,
+        merged: &[vector::ScoredResult],
+        session_ref: Option<&str>,
+        since_ref: Option<&str>,
+        until_ref: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let mut results = Vec::new();
+        if merged.is_empty() {
+            return Ok(results);
+        }
+
+        let placeholders: String = (1..=merged.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+             FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+             WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+            .iter()
+            .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            id_params.iter().map(AsRef::as_ref).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+
+        let mut entry_map = std::collections::HashMap::new();
+        for row in rows {
+            let (id, key, content, cat, ts, sid, ns, imp, sup, alias, aid) = row?;
+            entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup, alias, aid));
+        }
+
+        for scored in merged {
+            if let Some((key, content, cat, ts, sid, ns, imp, sup, alias, aid)) =
+                entry_map.remove(&scored.id)
+            {
+                if let Some(s) = since_ref
+                    && ts.as_str() < s
+                {
+                    continue;
+                }
+                if let Some(u) = until_ref
+                    && ts.as_str() > u
+                {
+                    continue;
+                }
+                let entry = MemoryEntry {
+                    id: scored.id.clone(),
+                    key,
+                    content,
+                    category: Self::str_to_category(&cat),
+                    timestamp: ts,
+                    session_id: sid,
+                    score: Some(f64::from(scored.final_score)),
+                    namespace: ns.unwrap_or_else(|| "default".into()),
+                    importance: imp,
+                    superseded_by: sup,
+                    agent_alias: alias,
+                    agent_id: aid,
+                };
+                if let Some(filter_sid) = session_ref
+                    && entry.session_id.as_deref() != Some(filter_sid)
+                {
+                    continue;
+                }
+                results.push(entry);
+            }
+        }
+
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// Lazily open the derived LanceDB index when `vector_index_backend` requests it.
+    #[cfg(feature = "memory-lancedb")]
+    async fn ensure_lance_index(&self) -> Option<Arc<super::lancedb_index::LanceDbVectorIndex>> {
+        if self.vector_index_backend != "lancedb" {
+            return None;
+        }
+        {
+            let guard = self.lance_index.lock();
+            if let Some(idx) = guard.as_ref() {
+                return Some(idx.clone());
+            }
+        }
+
+        let db_dir = self.db_path.parent().map(Path::to_path_buf)?;
+        match super::lancedb_index::LanceDbVectorIndex::open(&db_dir, "default").await {
+            Ok(idx) => {
+                if let Err(e) = idx.ensure_indexes().await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "LanceDB ensure_indexes failed; index will still be searched"
+                    );
+                }
+                let idx = Arc::new(idx);
+                *self.lance_index.lock() = Some(idx.clone());
+                Some(idx)
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to open LanceDB index; falling back to SQLite brute-force"
+                );
+                None
+            }
+        }
+    }
+
+    /// Delete and re-insert entries in the derived LanceDB index.
+    ///
+    /// This is a no-op when `vector_index_backend != "lancedb"`. Each prefix is
+    /// removed from the index before `entries` are upserted, making re-indexing
+    /// of a file idempotent.
+    #[cfg(feature = "memory-lancedb")]
+    pub async fn replace_lance_index_prefixes(
+        &self,
+        prefixes: &[String],
+        entries: &[super::lancedb_index::IndexEntry],
+    ) -> anyhow::Result<()> {
+        if self.vector_index_backend != "lancedb" {
+            return Ok(());
+        }
+        let Some(idx) = self.ensure_lance_index().await else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "LanceDB index unavailable; skipping derived-index update"
+            );
+            return Ok(());
+        };
+        for prefix in prefixes {
+            idx.delete_key_prefix(prefix)
+                .await
+                .with_context(|| format!("delete LanceDB entries for prefix: {prefix}"))?;
+        }
+        idx.upsert(entries)
+            .await
+            .context("upsert entries into LanceDB index")?;
+        Ok(())
+    }
+
     /// List memories by time range (used when query is empty).
     async fn recall_by_time_only(
         &self,
@@ -742,6 +985,69 @@ impl Memory for SqliteMemory {
             self.get_or_compute_embedding(query).await?
         };
 
+        // ── LanceDB fast path ─────────────────────────────────────
+        // When the derived vector index is enabled, route vector / FTS /
+        // hybrid search through LanceDB and only use SQLite to hydrate the
+        // winning ids into full MemoryEntry rows. On any error we log and
+        // fall through to the SQLite brute-force path.
+        #[cfg(feature = "memory-lancedb")]
+        if let Some(lance) = self.ensure_lance_index().await {
+            let req = super::lancedb_index::SearchRequest {
+                query_vector: query_embedding.clone(),
+                query_text: if self.search_mode == SearchMode::Embedding {
+                    None
+                } else {
+                    Some(query.to_string())
+                },
+                limit: limit.saturating_mul(2).max(1),
+                session_id: session_id.map(String::from),
+                namespace: None,
+                agent_id: None,
+                category: None,
+                superseded: false,
+            };
+            match lance.search(req).await {
+                Ok(scored_ids) => {
+                    let merged: Vec<vector::ScoredResult> = scored_ids
+                        .into_iter()
+                        .map(|s| vector::ScoredResult {
+                            id: s.id,
+                            vector_score: None,
+                            keyword_score: None,
+                            final_score: s.score,
+                        })
+                        .collect();
+                    if !merged.is_empty() {
+                        let conn = self.conn.clone();
+                        let sid = session_id.map(String::from);
+                        let since_owned = since.map(String::from);
+                        let until_owned = until.map(String::from);
+                        return tokio::task::spawn_blocking(move || {
+                            let conn = conn.lock();
+                            Self::fetch_entries_for_merged(
+                                &conn,
+                                &merged,
+                                sid.as_deref(),
+                                since_owned.as_deref(),
+                                until_owned.as_deref(),
+                                limit,
+                            )
+                        })
+                        .await?;
+                    }
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "LanceDB search failed; falling back to SQLite brute-force"
+                    );
+                }
+            }
+        }
+
         let conn = self.conn.clone();
         let query = query.to_string();
         let sid = session_id.map(String::from);
@@ -806,78 +1112,8 @@ impl Memory for SqliteMemory {
 
             // Fetch full entries for merged results in a single query
             // instead of N round-trips (N+1 pattern).
-            let mut results = Vec::new();
-            if !merged.is_empty() {
-                let placeholders: String = (1..=merged.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
-                     FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
-                     WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
-                    .iter()
-                    .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    id_params.iter().map(AsRef::as_ref).collect();
-                let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<f64>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                    ))
-                })?;
-
-                let mut entry_map = std::collections::HashMap::new();
-                for row in rows {
-                    let (id, key, content, cat, ts, sid, ns, imp, sup, alias, aid) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup, alias, aid));
-                }
-
-                for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, ns, imp, sup, alias, aid)) = entry_map.remove(&scored.id) {
-                        if let Some(s) = since_ref
-                            && ts.as_str() < s {
-                                continue;
-                            }
-                        if let Some(u) = until_ref
-                            && ts.as_str() > u {
-                                continue;
-                            }
-                        let entry = MemoryEntry {
-                            id: scored.id.clone(),
-                            key,
-                            content,
-                            category: Self::str_to_category(&cat),
-                            timestamp: ts,
-                            session_id: sid,
-                            score: Some(f64::from(scored.final_score)),
-                            namespace: ns.unwrap_or_else(|| "default".into()),
-                            importance: imp,
-                            superseded_by: sup,
-                            agent_alias: alias,
-                            agent_id: aid,
-                        };
-                        if let Some(filter_sid) = session_ref
-                            && entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
-                            }
-                        results.push(entry);
-                    }
-                }
-            }
+            let mut results =
+                Self::fetch_entries_for_merged(&conn, &merged, session_ref, since_ref, until_ref, limit)?;
 
             // If hybrid returned nothing, fall back to LIKE search.
             if results.is_empty() {
