@@ -803,7 +803,8 @@ impl SqliteMemory {
         }
 
         let db_dir = self.db_path.parent().map(Path::to_path_buf)?;
-        match super::lancedb_index::LanceDbVectorIndex::open(&db_dir, "default").await {
+        let namespace = self.alias.clone();
+        match super::lancedb_index::LanceDbVectorIndex::open(&db_dir, &namespace).await {
             Ok(idx) => {
                 if let Err(e) = idx.ensure_indexes().await {
                     ::zeroclaw_log::record!(
@@ -863,6 +864,154 @@ impl SqliteMemory {
             .await
             .context("upsert entries into LanceDB index")?;
         Ok(())
+    }
+
+    /// Rebuild the derived LanceDB index from the current SQLite `memories` table.
+    ///
+    /// Embeddings are reused from `embedding_cache` when available; missing
+    /// embeddings are computed in batches via the configured embedder. The old
+    /// LanceDB index is cleared before repopulation.
+    #[cfg(feature = "memory-lancedb")]
+    pub async fn rebuild_lance_index(&self, batch_size: usize) -> anyhow::Result<usize> {
+        if self.vector_index_backend != "lancedb" {
+            return Ok(0);
+        }
+        let Some(idx) = self.ensure_lance_index().await else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "LanceDB index unavailable; skipping rebuild"
+            );
+            return Ok(0);
+        };
+
+        // Clear any existing derived index.
+        idx.delete_key_prefix("")
+            .await
+            .context("clear old LanceDB index")?;
+
+        let batch_size = batch_size.max(1).min(256);
+        let conn = self.conn.clone();
+
+        let total: i64 = tokio::task::spawn_blocking({
+            move || -> anyhow::Result<i64> {
+                let conn = conn.lock();
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            }
+        })
+        .await
+        .context("spawn count task")??;
+
+        #[derive(Clone)]
+        struct Row {
+            id: String,
+            key: String,
+            content: String,
+            agent_id: Option<String>,
+            namespace: Option<String>,
+            session_id: Option<String>,
+            category: String,
+            superseded_by: Option<String>,
+            vector: Option<Vec<f32>>,
+        }
+
+        let mut indexed = 0usize;
+        #[allow(clippy::cast_possible_truncation)]
+        for offset in (0..total).step_by(batch_size) {
+            let offset = offset as i64;
+            let limit = batch_size as i64;
+            let conn = self.conn.clone();
+            let mut rows: Vec<Row> = tokio::task::spawn_blocking({
+                move || -> anyhow::Result<Vec<Row>> {
+                    let conn = conn.lock();
+                    let mut stmt = conn.prepare(
+                        "SELECT m.id, m.key, m.content, m.agent_id, m.namespace, m.session_id, m.category, m.superseded_by \
+                         FROM memories m \
+                         WHERE m.superseded_by IS NULL \
+                         ORDER BY m.rowid \
+                         LIMIT ?1 OFFSET ?2",
+                    )?;
+                    let rows = stmt.query_map([limit, offset], |row| {
+                        let content: String = row.get(2)?;
+                        let hash = Self::content_hash(&content);
+                        let vector: Option<Vec<f32>> = conn
+                            .query_row(
+                                "SELECT embedding FROM embedding_cache WHERE content_hash = ?1",
+                                [&hash],
+                                |r| {
+                                    let bytes: Vec<u8> = r.get(0)?;
+                                    Ok(vector::bytes_to_vec(&bytes))
+                                },
+                            )
+                            .ok();
+                        Ok(Row {
+                            id: row.get(0)?,
+                            key: row.get(1)?,
+                            content,
+                            agent_id: row.get(3)?,
+                            namespace: row.get(4)?,
+                            session_id: row.get(5)?,
+                            category: row.get::<_, String>(6)?,
+                            superseded_by: row.get(7)?,
+                            vector,
+                        })
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .context("collect rows for LanceDB rebuild")
+                }
+            })
+            .await
+            .context("spawn batch read task")??;
+
+            // Compute missing embeddings in one batch call.
+            let missing_indices: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.vector.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            if !missing_indices.is_empty() {
+                let texts: Vec<&str> = missing_indices.iter().map(|&i| rows[i].content.as_str()).collect();
+                let computed = self.embedder.embed(&texts).await.context("batch embed for rebuild")?;
+                if computed.len() != texts.len() {
+                    anyhow::bail!("embedder returned {} vectors for {} texts", computed.len(), texts.len());
+                }
+                for (j, &i) in missing_indices.iter().enumerate() {
+                    rows[i].vector = Some(computed[j].clone());
+                }
+            }
+
+            let entries: Vec<super::lancedb_index::IndexEntry> = rows
+                .into_iter()
+                .filter_map(|r| {
+                    let vector = r.vector?;
+                    Some(super::lancedb_index::IndexEntry {
+                        id: r.id,
+                        key: r.key,
+                        content: r.content,
+                        vector,
+                        agent_id: r.agent_id,
+                        namespace: r.namespace.unwrap_or_else(|| "default".into()),
+                        session_id: r.session_id,
+                        category: r.category,
+                        superseded_by: r.superseded_by,
+                    })
+                })
+                .collect();
+
+            if !entries.is_empty() {
+                idx.upsert(&entries).await.context("upsert batch into LanceDB")?;
+                indexed += entries.len();
+            }
+        }
+
+        Ok(indexed)
     }
 
     /// List memories by time range (used when query is empty).
