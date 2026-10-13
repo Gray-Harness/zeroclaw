@@ -1137,8 +1137,9 @@ impl Memory for SqliteMemory {
         // ── LanceDB fast path ─────────────────────────────────────
         // When the derived vector index is enabled, route vector / FTS /
         // hybrid search through LanceDB and only use SQLite to hydrate the
-        // winning ids into full MemoryEntry rows. On any error we log and
-        // fall through to the SQLite brute-force path.
+        // winning ids into full MemoryEntry rows. On any error — or when
+        // none of the returned ids resolve in SQLite (stale derived index)
+        // — we log and fall through to the SQLite brute-force path.
         #[cfg(feature = "memory-lancedb")]
         if let Some(lance) = self.ensure_lance_index().await {
             let req = super::lancedb_index::SearchRequest {
@@ -1167,11 +1168,12 @@ impl Memory for SqliteMemory {
                         })
                         .collect();
                     if !merged.is_empty() {
+                        let stale_id_count = merged.len();
                         let conn = self.conn.clone();
                         let sid = session_id.map(String::from);
                         let since_owned = since.map(String::from);
                         let until_owned = until.map(String::from);
-                        return tokio::task::spawn_blocking(move || {
+                        let entries = tokio::task::spawn_blocking(move || {
                             let conn = conn.lock();
                             Self::fetch_entries_for_merged(
                                 &conn,
@@ -1182,7 +1184,26 @@ impl Memory for SqliteMemory {
                                 limit,
                             )
                         })
-                        .await?;
+                        .await??;
+                        if !entries.is_empty() {
+                            return Ok(entries);
+                        }
+                        // The derived index returned ids that no longer
+                        // resolve in SQLite (re-import or rebuild rotated
+                        // row ids; single-row stores never update the
+                        // derived index). Returning here would surface a
+                        // total retrieval miss, so log and fall through to
+                        // the SQLite brute-force path below.
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "stale_ids": stale_id_count,
+                                    "alias": self.alias.as_str(),
+                                })),
+                            "LanceDB returned stale ids (none resolved in SQLite); falling back to SQLite brute-force"
+                        );
                     }
                 }
                 Err(e) => {
@@ -3986,6 +4007,62 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
+    }
+
+    // Regression: a derived LanceDB index whose ids no longer exist in
+    // SQLite (re-import rotated row ids; single-row stores never update
+    // the derived index) must not short-circuit recall with an empty
+    // result. The stale fast path has to fall back to SQLite brute-force.
+    #[cfg(feature = "memory-lancedb")]
+    #[tokio::test]
+    async fn lancedb_stale_ids_fall_back_to_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mem = SqliteMemory::with_embedder_at_path_full(
+            "test",
+            &db_path,
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+            "lancedb".into(),
+        )
+        .unwrap();
+        mem.store(
+            "real",
+            "Rust programming language",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Plant derived-index entries whose ids are not in SQLite, with
+        // content that wins the FTS ranking for the query below. Enough
+        // rows are needed for the IVF index build to train on first upsert.
+        let stale: Vec<super::super::lancedb_index::IndexEntry> = (0..64)
+            .map(|i| super::super::lancedb_index::IndexEntry {
+                id: format!("stale-id-not-in-sqlite-{i}"),
+                key: format!("stale-{i}"),
+                content: format!("Rust Rust Rust {i}"),
+                vector: vec![i as f32, 1.0, 2.0, 3.0],
+                agent_id: None,
+                namespace: "default".to_string(),
+                session_id: None,
+                category: "core".to_string(),
+                superseded_by: None,
+            })
+            .collect();
+        mem.replace_lance_index_prefixes(&[], &stale).await.unwrap();
+
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        assert!(
+            results.iter().any(|e| e.key == "real"),
+            "recall must fall back to SQLite when LanceDB ids are stale, got: {:?}",
+            results.iter().map(|e| &e.key).collect::<Vec<_>>()
+        );
     }
 
     // Wires-crossed regression coverage. The user reported memory rows
